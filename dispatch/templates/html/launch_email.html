@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Miyu is here</title>
+</head>
+<body style="margin:0; padding:0; background-color:#0b0710; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#0b0710;">
+    <tr>
+      <td align="center" style="padding: 32px 16px;">
+        <table role="presentation" width="100%" style="max-width:520px; background-color:#15101c; border:1px solid #2a2233; border-radius:16px; overflow:hidden;">
+
+          <!-- Header -->
+          <tr>
+            <td align="center" style="padding: 36px 32px 12px 32px;">
+              <div style="font-family: 'Courier New', monospace; letter-spacing: 2px; font-size: 13px; color:#f5a8c0; text-transform: uppercase;">MiyuLabs</div>
+              <div style="height:16px;"></div>
+              <div style="font-family: 'Courier New', monospace; font-size: 22px; font-weight:700; color:#f4f0f6;">Miyu is here 🌙</div>
+            </td>
+          </tr>
+
+          <!-- Body copy -->
+          <tr>
+            <td style="padding: 8px 32px 0 32px; color:#cfc7d8; font-size:15px; line-height:1.6;">
+              <p style="margin: 0 0 16px 0;">Hey,</p>
+              <p style="margin: 0 0 16px 0;">
+                Miyu is officially open for pre-orders.
+              </p>
+              <p style="margin: 0 0 16px 0;">
+                A while back you joined the waitlist for Miyu — the ambient desk companion that keeps time, helps you focus, and quietly keeps someone you care about close.
+              </p>
+              <p style="margin: 0 0 16px 0;">
+                As a thank you, we're giving early supporters a special pre-order discount on the first 100 orders:
+              </p>
+            </td>
+          </tr>
+
+          <!-- Discount card -->
+          <tr>
+            <td style="padding: 4px 32px 0 32px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#1e1728; border:1px solid #352a41; border-radius:12px;">
+                <tr>
+                  <td style="padding: 20px 24px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                      <tr>
+                        <td style="color:#e8e2ee; font-size:14px; padding: 12px 0 6px 0;">
+                          <div style="font-weight: 700;">Solo Pack</div>
+                          <div style="font-size:12px; color:#9d92ac; margin-top:2px;">1x Miyu Desk Companion</div>
+                        </td>
+                        <td align="right" style="padding: 12px 0 6px 0;">
+                          <div style="font-size:12px; color:#6f6579; text-decoration:line-through;">MRP {{ solo_mrp }}</div>
+                          <div style="font-size:13px; color:#e8e2ee; margin-top:2px;">Launch {{ solo_price }}</div>
+                          <div style="font-size:13px; color:#f2994a; margin-top:2px;">Early pre-order -{{ preorder_discount }}</div>
+                          <div style="font-size:16px; font-weight:700; color:#f4f0f6; margin-top:4px;">{{ solo_effective }}</div>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#e8e2ee; font-size:14px; padding: 12px 0 6px 0; border-top:1px solid #352a41;">
+                          <div style="font-weight: 700;">Partner Pack</div>
+                          <div style="font-size:12px; color:#9d92ac; margin-top:2px;">2x Miyu Units</div>
+                        </td>
+                        <td align="right" style="padding: 12px 0 6px 0; border-top:1px solid #352a41;">
+                          <div style="font-size:12px; color:#6f6579; text-decoration:line-through;">MRP {{ partner_mrp }}</div>
+                          <div style="font-size:13px; color:#e8e2ee; margin-top:2px;">Base {{ partner_price }}</div>
+                          <div style="font-size:13px; color:#f5a8c0; margin-top:2px;">Partner -{{ partner_discount }}</div>
+                          <div style="font-size:13px; color:#f2994a; margin-top:2px;">Early pre-order -{{ preorder_discount }}</div>
+                          <div style="font-size:16px; font-weight:700; color:#f4f0f6; margin-top:4px;">{{ partner_effective }}</div>
+                        </td>
+                      </tr>
+                    </table>
+                    {% if promo_code %}
+                    <div style="margin-top:14px; padding-top:14px; border-top:1px solid #352a41; text-align:center;">
+                      <span style="font-size:12px; color:#9d92ac; letter-spacing:1px; text-transform:uppercase;">Use code</span>
+                      <div style="font-family:'Courier New', monospace; font-size:16px; color:#f4f0f6; letter-spacing:2px; margin-top:4px;">{{ promo_code }}</div>
+                    </div>
+                    {% endif %}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- CTA -->
+          <tr>
+            <td align="center" style="padding: 28px 32px 8px 32px;">
+              <table role="presentation" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td align="center" style="border-radius:10px; background-color:#f5a8c0;">
+                    <a href="{{ pre_order_url }}" style="display:inline-block; padding:14px 32px; font-size:15px; font-weight:700; color:#15101c; text-decoration:none; border-radius:10px;">
+                      Pre-order Miyu
+                    </a>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <tr>
+            <td align="center" style="padding: 4px 32px 32px 32px;">
+              <a href="{{ explore_url }}" style="font-size:13px; color:#9d92ac; text-decoration:underline;">See Miyu in action first →</a>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 20px 32px 32px 32px; border-top:1px solid #2a2233;">
+              <p style="margin:16px 0 0 0; font-size:12px; color:#6f6579; line-height:1.6;">
+                You're receiving this because you joined the Miyu waitlist. MiyuLabs · a 3am desk companion.
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

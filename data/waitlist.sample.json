@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "email": "alice@example.com",
+    "createdAt": "2026-05-10T00:15:12.931Z",
+    "source": "waitlist"
+  },
+  {
+    "id": 2,
+    "email": "bob@example.com",
+    "createdAt": "2026-05-11T09:02:44.000Z",
+    "source": "waitlist"
+  },
+  {
+    "id": 3,
+    "email": "not-a-real-email",
+    "createdAt": "2026-05-12T02:00:00.000Z",
+    "source": "waitlist"
+  },
+  {
+    "id": 4,
+    "email": "thiswillpass@gmail.com",
+    "createdAt": "2026-05-10T00:15:12.931Z",
+    "source": "waitlist"
+  }
+]
