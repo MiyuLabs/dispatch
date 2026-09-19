@@ -1,6 +1,6 @@
 # MiyuLabs — Campaign Mailer
 
-Lightweight, extensible, stateful campaign mailer and delivery engine for MiyuLabs. Built to reliably email waitlists and product announcements from a local machine or a $5 VPS without Redis or external job queues, which is more than enough for up to tens of thousands of sends. Imports recipients, renders campaign-specific templates, and delivers through Resend with SQLite-backed durable job state, concurrent rate-limited sending, automatic retries with exponential backoff, and idempotent campaign delivery.
+Lightweight, extensible, stateful campaign mailer and delivery engine for MiyuLabs. Built to reliably email waitlists and product announcements from a local machine or a $5 VPS without Redis or external job queues, which is more than enough for up to tens of thousands of sends. Imports recipients, renders campaign-specific templates, and delivers through Resend with SQLite-backed durable job state, batched rate-limited sending, automatic retries with exponential backoff, and idempotent campaign delivery.
 
 <img width="1536" height="1024" alt="dispatch_architecture" src="https://github.com/user-attachments/assets/2ec1a762-b735-4202-8b27-9a909631701f" />
 
