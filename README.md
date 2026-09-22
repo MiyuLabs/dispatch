@@ -232,5 +232,5 @@ uv run --with pytest pytest
 
 ## License
 
-[MIT License](LICENSE).
+[GNU LGPL v2.1](LICENSE).
 Copyright (c) 2026 MiyuLabs.
