@@ -10,7 +10,7 @@ from typing import Optional
 from .config import Settings
 from .db import StateStore
 from .models import Recipient
-from .providers.base import EmailJob, EmailProvider
+from .providers.base import EmailJob, EmailProvider, recipient_idempotency_key
 from .sources.base import Source
 from .templates.base import Template
 from .validation import RecipientValidator
@@ -224,7 +224,15 @@ class SendEngine:
                 self.store.mark_failed(row["send_id"], row["attempts"] + 1, f"render error: {exc}", next_attempt_at=None)
                 stats.failed_exhausted += 1
                 continue
-            jobs.append(EmailJob(ref=row["send_id"], to=recipient.email, subject=rendered.subject, html=rendered.html, text=rendered.text))
+            key = recipient_idempotency_key(campaign, row["send_id"])
+            jobs.append(EmailJob(
+                ref=row["send_id"],
+                to=recipient.email,
+                subject=rendered.subject,
+                html=rendered.html,
+                text=rendered.text,
+                idempotency_key=key,
+            ))
 
         if not jobs:
             return

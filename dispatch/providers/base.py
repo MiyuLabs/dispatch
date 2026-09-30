@@ -20,6 +20,15 @@ class SendResult:
     provider_message_id: str
 
 
+def recipient_idempotency_key(campaign: str, send_id: int | str) -> str:
+    """Deterministic, per-recipient logical delivery idempotency key.
+
+    Stable across retries, reorderings, and batch membership changes.
+    Namespaced by campaign to ensure isolation across campaigns.
+    """
+    return f"dispatch:{campaign}:send:{send_id}"
+
+
 @dataclass(frozen=True)
 class EmailJob:
     """Everything a provider needs to send one message, tagged with the
@@ -31,6 +40,7 @@ class EmailJob:
     subject: str
     html: str
     text: str
+    idempotency_key: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -93,8 +103,10 @@ class EmailProvider(ABC):
         provider, just not efficient — override this for a provider with a
         real bulk endpoint."""
         results = []
-        for i, job in enumerate(jobs):
-            key = f"{idempotency_key_prefix}:{i}" if idempotency_key_prefix else None
+        for job in jobs:
+            key = job.idempotency_key
+            if not key and idempotency_key_prefix:
+                key = f"{idempotency_key_prefix}:send:{job.ref}"
             try:
                 result = self.send(
                     to=job.to, subject=job.subject, html=job.html, text=job.text,

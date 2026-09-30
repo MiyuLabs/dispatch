@@ -56,13 +56,25 @@ def _retry_after_of(exc: Exception) -> Optional[float]:
     return None
 
 
-def _batch_key(prefix: str, chunk: list[EmailJob]) -> str:
-    """One idempotency key per exact set of recipients in this call. If the
-    same chunk is retried unchanged, Resend recognizes it and won't
-    double-send. If the chunk's membership changes (e.g. a smaller retry
-    after some jobs already succeeded), the key changes too, as it must."""
-    digest = hashlib.sha256(",".join(sorted(str(j.ref) for j in chunk)).encode()).hexdigest()[:24]
+def batch_request_idempotency_key(prefix: str, chunk: list[EmailJob]) -> str:
+    """Transport-level idempotency key for a Resend batch API request.
+
+    Derived deterministically from the logical delivery identities of the jobs
+    in this batch chunk. If the exact same batch chunk is retried, Resend
+    recognizes the batch key and deduplicates the API request. If the batch
+    composition changes (e.g. retrying a failed subset), the transport batch key
+    adapts to the new subset while each job's logical per-recipient delivery
+    key remains unchanged.
+    """
+    identities = [
+        job.idempotency_key if job.idempotency_key else f"{prefix}:send:{job.ref}"
+        for job in chunk
+    ]
+    digest = hashlib.sha256(",".join(sorted(identities)).encode()).hexdigest()[:24]
     return f"{prefix}:batch:{digest}"
+
+
+_batch_key = batch_request_idempotency_key
 
 
 class ResendProvider(EmailProvider):
@@ -117,6 +129,11 @@ class ResendProvider(EmailProvider):
         except Exception as exc:
             status = _status_of(exc)
             if status in _SINGLE_SEND_PERMANENT_STATUS_CODES:
+                raise PermanentProviderError(f"{type(exc).__name__}: {exc}") from exc
+            if status == 409:
+                err_str = str(exc).lower()
+                if "concurrent" in err_str:
+                    raise TransientProviderError(f"{type(exc).__name__}: {exc}") from exc
                 raise PermanentProviderError(f"{type(exc).__name__}: {exc}") from exc
             raise TransientProviderError(f"{type(exc).__name__}: {exc}") from exc
 
@@ -174,8 +191,17 @@ class ResendProvider(EmailProvider):
                 # Reuse the ABC's naive per-item loop as the fallback path.
                 return super().send_batch(
                     chunk, from_email=from_email, from_name=from_name, reply_to=reply_to,
-                    idempotency_key_prefix=f"{idempotency_key_prefix}:fallback" if idempotency_key_prefix else None,
+                    idempotency_key_prefix=idempotency_key_prefix,
                 )
+            if status == 409:
+                err_str = str(exc).lower()
+                is_concurrent = "concurrent" in err_str
+                error_msg = f"{type(exc).__name__}: {exc}"
+                return [
+                    BatchItemResult(ref=job.ref, ok=False, error=error_msg, permanent=not is_concurrent,
+                                     retry_after_seconds=retry_after)
+                    for job in chunk
+                ]
             # Auth/domain/quota/rate-limit/5xx/unknown: not item-specific.
             # Retry the whole chunk later, unchanged.
             error_msg = f"{type(exc).__name__}: {exc}"
