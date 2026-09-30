@@ -15,6 +15,11 @@ class PermanentProviderError(Exception):
     without burning through retry attempts."""
 
 
+class AmbiguousProviderError(Exception):
+    """An uncertain outcome where the external provider may or may not have
+    accepted the send (e.g. timeout, connection reset, lost response)."""
+
+
 @dataclass(frozen=True)
 class SendResult:
     provider_message_id: str
@@ -51,6 +56,10 @@ class BatchItemResult:
     # provider could extract one. The engine uses this as a floor under its
     # own computed exponential backoff rather than replacing it outright.
     retry_after_seconds: Optional[float] = None
+    # True if the outcome is ambiguous (e.g. network timeout or connection drop)
+    # where the provider may have processed the email. Recovery will retry with
+    # the exact same idempotency identity.
+    ambiguous: bool = False
 
 
 class EmailProvider(ABC):
@@ -88,13 +97,19 @@ class EmailProvider(ABC):
         from_name: Optional[str] = None,
         reply_to: Optional[str] = None,
         idempotency_key_prefix: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> list[BatchItemResult]:
         """Naive default: one `send()` call per job. Correct for any
         provider, just not efficient — override this for a provider with a
         real bulk endpoint."""
         results = []
         for i, job in enumerate(jobs):
-            key = f"{idempotency_key_prefix}:{i}" if idempotency_key_prefix else None
+            if idempotency_key:
+                key = idempotency_key if len(jobs) == 1 else f"{idempotency_key}:{i}"
+            elif idempotency_key_prefix:
+                key = f"{idempotency_key_prefix}:{i}"
+            else:
+                key = None
             try:
                 result = self.send(
                     to=job.to, subject=job.subject, html=job.html, text=job.text,
@@ -103,6 +118,8 @@ class EmailProvider(ABC):
                 )
             except PermanentProviderError as e:
                 results.append(BatchItemResult(ref=job.ref, ok=False, error=str(e), permanent=True))
+            except AmbiguousProviderError as e:
+                results.append(BatchItemResult(ref=job.ref, ok=False, error=str(e), permanent=False, ambiguous=True))
             except TransientProviderError as e:
                 results.append(BatchItemResult(ref=job.ref, ok=False, error=str(e), permanent=False))
             else:

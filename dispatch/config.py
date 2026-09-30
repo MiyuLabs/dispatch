@@ -36,6 +36,8 @@ class Settings:
     pre_order_url: str
     explore_url: str
 
+    sending_stale_after_seconds: float = 300.0
+
     @classmethod
     def from_env(cls) -> "Settings":
         def get(name: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
@@ -74,4 +76,5 @@ class Settings:
             mx_lookup_timeout_seconds=get_float("MX_LOOKUP_TIMEOUT_SECONDS", 3.0),
             pre_order_url=pre_order_url,
             explore_url=get("EXPLORE_URL", f"{pre_order_url.rstrip('/')}/explore"),
+            sending_stale_after_seconds=get_float("SENDING_STALE_AFTER_SECONDS", 300.0),
         )

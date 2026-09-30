@@ -99,6 +99,7 @@ cp .env.example .env
 | `MAX_ATTEMPTS` | Maximum retry attempts for transient errors before job dies | `5` |
 | `BASE_BACKOFF_SECONDS` | Initial backoff multiplier for retry jitter | `2` |
 | `MAX_BACKOFF_SECONDS` | Maximum cap for exponential retry backoff | `600` |
+| `SENDING_STALE_AFTER_SECONDS` | Inactivity threshold (seconds) before recovering stale in-flight submissions | `300` |
 | `VALIDATE_DELIVERABILITY`| Perform DNS MX check before queueing | `true` |
 | `MX_LOOKUP_TIMEOUT_SECONDS`| DNS resolution timeout per domain | `3` |
 
@@ -160,6 +161,21 @@ If jobs enter backoff due to transient network or provider issues:
   ```bash
   */5 * * * * cd /opt/dispatch && set -a && source .env && set +a && uv run dispatch send --campaign launch-2026-09
   ```
+
+---
+
+## Stale Job Recovery & Provider Idempotency
+
+When Dispatch claims jobs for delivery, rows transition to `sending` (and associated provider submissions are recorded). The recovery model handles network interruptions, crashes, and provider timeouts safely:
+
+1. **In-Flight Semantics:** A job marked `sending` indicates that a provider submission is in progress or that its outcome has not yet been conclusively reconciled.
+2. **Ambiguous Outcomes (Timeout != Failure):** A network timeout, dropped socket, or transient 5xx does *not* imply delivery failed remotely. The provider may have accepted and queued the message even if Dispatch never received the HTTP response.
+3. **Preserving Operation Identity:** Stale recovery does not blindly convert unconfirmed jobs back to ordinary `pending` state. Instead, Dispatch records a durable submission record (`provider_submissions`) prior to calling the provider. Recovery recovers the exact logical submission (preserving original batch membership and send order) rather than regrouping jobs with new pending sends.
+4. **Idempotency Key Reuse:** When recovering an ambiguous submission, Dispatch reuses the exact same deterministic idempotency key (`options["idempotency_key"]`). If Resend already processed the original submission, its idempotency mechanism deduplicates the operation rather than delivering duplicate emails.
+5. **Configurable Stale Threshold:** Recovery triggers when an in-flight submission has remained uncompleted past `SENDING_STALE_AFTER_SECONDS` (default: `300` seconds / 5 minutes). This threshold can be customized via environment variables.
+6. **Provider Idempotency Window:** Idempotent deduplication relies on the upstream provider's retention window (e.g. Resend's idempotency key expiration). Recovery operations executed within this window are safely deduplicated; requests executed after key expiration carry risks of duplicate sends.
+7. **No Distributed Transactions:** SQLite and remote REST email APIs do not share a distributed two-phase commit transaction. While Dispatch's durable submission tracking and idempotency key reuse eliminate local duplicate dispatching within the provider window, remote systems are subject to standard eventual-consistency constraints.
+8. **Legacy Stale Jobs:** Unsubmitted legacy `sending` rows lacking tracked submission metadata (such as from pre-migration crashes) are moved back to `pending` by the baseline stale recovery mechanism, while jobs tied to registered submissions are reconciled strictly through the idempotency-preserving submission recovery workflow.
 
 ---
 

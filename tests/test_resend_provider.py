@@ -125,3 +125,43 @@ def test_retry_after_extraction_from_exc_headers():
     err = _HeaderError({"retry-after": "15.5"})
     assert _retry_after_of(err) == 15.5
 
+
+def test_batch_500_or_timeout_classified_as_ambiguous():
+    jobs = [
+        EmailJob(ref=1, to="a@example.com", subject="s", html="<p/>", text="t"),
+        EmailJob(ref=2, to="b@example.com", subject="s", html="<p/>", text="t"),
+    ]
+    provider = _provider()
+    with patch("dispatch.providers.resend_provider.resend.Batch.send") as mock_batch:
+        mock_batch.side_effect = _FakeError(500)
+        results = provider.send_batch(jobs, from_email="hi@miyulabs.in")
+
+    assert len(results) == 2
+    assert all(not r.ok for r in results)
+    assert all(not r.permanent for r in results)
+    assert all(r.ambiguous for r in results)
+
+    # Network timeout with no status code
+    with patch("dispatch.providers.resend_provider.resend.Batch.send") as mock_batch:
+        mock_batch.side_effect = TimeoutError("Connection timed out")
+        results = provider.send_batch(jobs, from_email="hi@miyulabs.in")
+
+    assert len(results) == 2
+    assert all(not r.ok for r in results)
+    assert all(r.ambiguous for r in results)
+
+
+def test_batch_passes_explicit_idempotency_key():
+    jobs = [
+        EmailJob(ref=1, to="a@example.com", subject="s", html="<p/>", text="t"),
+    ]
+    provider = _provider()
+    with patch("dispatch.providers.resend_provider.resend.Batch.send") as mock_batch:
+        mock_batch.return_value = {"data": [{"id": "id-1"}]}
+        provider.send_batch(jobs, from_email="hi@miyulabs.in", idempotency_key="custom-idem-key")
+
+    mock_batch.assert_called_once()
+    call_args, call_kwargs = mock_batch.call_args
+    # The second positional argument is options dict
+    options = call_args[1]
+    assert options.get("idempotency_key") == "custom-idem-key"

@@ -52,14 +52,28 @@ CREATE TABLE IF NOT EXISTS campaign_recipients (
     imported_at TEXT NOT NULL,
     UNIQUE(campaign, recipient_id)
 );
+
+CREATE TABLE IF NOT EXISTS provider_submissions (
+    id TEXT PRIMARY KEY,
+    campaign TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    send_ids TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'submitted',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_submissions_recovery
+    ON provider_submissions(campaign, status, updated_at);
 """
 
 # Valid statuses:
-#   pending -> sending -> sent                         (success)
+#   pending -> sending -> submitted -> sent            (success)
 #                       -> failed  -> sending (retried) (transient, will retry — next_attempt_at is set)
 #                       -> dead                         (transient retries exhausted, or a permanent
 #                                                         error — next_attempt_at is NULL, never reclaimed)
 #                       -> skipped                      (manual, e.g. unsubscribed)
+#                       -> submitted                    (in-flight / ambiguous provider submission)
 TERMINAL_STATUSES = {"sent", "skipped", "dead"}
 
 
@@ -255,18 +269,141 @@ class StateStore:
             ).fetchall()
 
     def recover_stale_sending_jobs(self, campaign: str, older_than_seconds: float = 300) -> int:
-        """Reset jobs stuck in 'sending' (e.g. from an interrupted or crashed run)
-        back to 'pending' if updated_at is older than `older_than_seconds` ago."""
+        """Reset jobs stuck in 'sending' (e.g. from an interrupted or crashed run
+        before provider submission was initiated) back to 'pending' if updated_at
+        is older than `older_than_seconds` ago, protecting any jobs that belong
+        to active provider submissions."""
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat()
         now = _now()
         with self._connect() as conn:
-            cur = conn.execute(
-                """UPDATE campaign_sends
-                   SET status='pending', updated_at=?
-                   WHERE campaign=? AND status='sending' AND updated_at<=?""",
-                (now, campaign, cutoff),
-            )
+            active_subs = conn.execute(
+                "SELECT send_ids FROM provider_submissions WHERE campaign=? AND status IN ('submitted', 'ambiguous')",
+                (campaign,),
+            ).fetchall()
+            protected_ids: set[int] = set()
+            for sub in active_subs:
+                try:
+                    protected_ids.update(json.loads(sub["send_ids"]))
+                except Exception:
+                    pass
+
+            if protected_ids:
+                placeholders = ",".join("?" * len(protected_ids))
+                cur = conn.execute(
+                    f"""UPDATE campaign_sends
+                       SET status='pending', updated_at=?
+                       WHERE campaign=? AND status='sending' AND updated_at<=?
+                         AND id NOT IN ({placeholders})""",
+                    (now, campaign, cutoff, *protected_ids),
+                )
+            else:
+                cur = conn.execute(
+                    """UPDATE campaign_sends
+                       SET status='pending', updated_at=?
+                       WHERE campaign=? AND status='sending' AND updated_at<=?""",
+                    (now, campaign, cutoff),
+                )
             return cur.rowcount
+
+    # ---- provider submissions & ambiguous recovery ------------------------
+
+    def record_submission(
+        self,
+        submission_id: str,
+        campaign: str,
+        idempotency_key: str,
+        send_ids: list[int],
+    ) -> None:
+        """Durably persist an in-flight provider submission before calling the provider."""
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """INSERT OR REPLACE INTO provider_submissions
+                   (id, campaign, idempotency_key, send_ids, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'submitted', ?, ?)""",
+                (submission_id, campaign, idempotency_key, json.dumps(send_ids), now, now),
+            )
+            if send_ids:
+                placeholders = ",".join("?" * len(send_ids))
+                conn.execute(
+                    f"UPDATE campaign_sends SET status='submitted', updated_at=? WHERE id IN ({placeholders})",
+                    (now, *send_ids),
+                )
+            conn.execute("COMMIT")
+
+    def mark_submission_ambiguous(self, submission_id: str, error: str) -> None:
+        """Mark an in-flight submission as ambiguous when a network failure,
+        timeout, or unparseable response leaves the external provider outcome uncertain."""
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            sub = conn.execute(
+                "SELECT send_ids FROM provider_submissions WHERE id=?",
+                (submission_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE provider_submissions SET status='ambiguous', updated_at=? WHERE id=?",
+                (now, submission_id),
+            )
+            if sub and sub["send_ids"]:
+                try:
+                    send_ids = json.loads(sub["send_ids"])
+                    if send_ids:
+                        placeholders = ",".join("?" * len(send_ids))
+                        conn.execute(
+                            f"""UPDATE campaign_sends
+                               SET status='submitted', last_error=?, updated_at=?
+                               WHERE id IN ({placeholders}) AND status NOT IN ('sent', 'dead')""",
+                            (error[:2000], now, *send_ids),
+                        )
+                except Exception:
+                    pass
+            conn.execute("COMMIT")
+
+    def complete_submission(self, submission_id: str) -> None:
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE provider_submissions SET status='completed', updated_at=? WHERE id=?",
+                (now, submission_id),
+            )
+
+    def fail_submission(self, submission_id: str) -> None:
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE provider_submissions SET status='failed', updated_at=? WHERE id=?",
+                (now, submission_id),
+            )
+
+    def get_stale_submissions(self, campaign: str, older_than_seconds: float = 300) -> list[sqlite3.Row]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat()
+        with self._connect() as conn:
+            return conn.execute(
+                """SELECT id, campaign, idempotency_key, send_ids, status, created_at, updated_at
+                   FROM provider_submissions
+                   WHERE campaign=? AND status IN ('submitted', 'ambiguous') AND updated_at<=?
+                   ORDER BY created_at""",
+                (campaign, cutoff),
+            ).fetchall()
+
+    def get_jobs_by_ids(self, campaign: str, send_ids: list[int]) -> list[sqlite3.Row]:
+        if not send_ids:
+            return []
+        placeholders = ",".join("?" * len(send_ids))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT cs.id AS send_id, cs.attempts, cs.status,
+                           r.id AS recipient_id, r.email, r.source,
+                           r.external_id, r.metadata, r.source_created_at
+                    FROM campaign_sends cs
+                    JOIN recipients r ON r.id = cs.recipient_id
+                    WHERE cs.campaign = ? AND cs.id IN ({placeholders})""",
+                (campaign, *send_ids),
+            ).fetchall()
+            rows_by_id = {r["send_id"]: r for r in rows}
+            return [rows_by_id[sid] for sid in send_ids if sid in rows_by_id]
 
     def mark_sent(self, send_id: int, provider_message_id: Optional[str]) -> None:
         with self._connect() as conn:
@@ -315,13 +452,13 @@ class StateStore:
             return {r["status"]: r["n"] for r in rows}
 
     def failed_jobs(self, campaign: str, limit: int = 50) -> list[sqlite3.Row]:
-        """Both 'failed' (still retrying) and 'dead' (exhausted/permanent)
-        jobs — everything worth a human's attention."""
+        """Both 'failed' (still retrying), 'dead' (exhausted/permanent), and
+        'submitted' (ambiguous in-flight) jobs — everything worth a human's attention."""
         with self._connect() as conn:
             return conn.execute(
                 """SELECT cs.id, cs.status, r.email, cs.attempts, cs.last_error, cs.updated_at
                    FROM campaign_sends cs JOIN recipients r ON r.id = cs.recipient_id
-                   WHERE cs.campaign=? AND cs.status IN ('failed', 'dead')
+                   WHERE cs.campaign=? AND cs.status IN ('failed', 'dead', 'submitted')
                    ORDER BY cs.updated_at DESC LIMIT ?""",
                 (campaign, limit),
             ).fetchall()

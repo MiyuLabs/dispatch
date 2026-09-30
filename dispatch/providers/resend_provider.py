@@ -7,6 +7,7 @@ from typing import Optional
 import resend
 
 from .base import (
+    AmbiguousProviderError,
     BatchItemResult,
     EmailJob,
     EmailProvider,
@@ -56,13 +57,16 @@ def _retry_after_of(exc: Exception) -> Optional[float]:
     return None
 
 
-def _batch_key(prefix: str, chunk: list[EmailJob]) -> str:
+def compute_batch_idempotency_key(prefix: str, jobs_or_refs: list[EmailJob | int | str]) -> str:
     """One idempotency key per exact set of recipients in this call. If the
     same chunk is retried unchanged, Resend recognizes it and won't
-    double-send. If the chunk's membership changes (e.g. a smaller retry
-    after some jobs already succeeded), the key changes too, as it must."""
-    digest = hashlib.sha256(",".join(sorted(str(j.ref) for j in chunk)).encode()).hexdigest()[:24]
+    double-send. If the chunk's membership changes, the key changes too."""
+    refs = [j.ref if isinstance(j, EmailJob) else j for j in jobs_or_refs]
+    digest = hashlib.sha256(",".join(sorted(str(r) for r in refs)).encode()).hexdigest()[:24]
     return f"{prefix}:batch:{digest}"
+
+
+_batch_key = compute_batch_idempotency_key
 
 
 class ResendProvider(EmailProvider):
@@ -118,6 +122,10 @@ class ResendProvider(EmailProvider):
             status = _status_of(exc)
             if status in _SINGLE_SEND_PERMANENT_STATUS_CODES:
                 raise PermanentProviderError(f"{type(exc).__name__}: {exc}") from exc
+            if status == 429:
+                raise TransientProviderError(f"{type(exc).__name__}: {exc}") from exc
+            if status is None or status >= 500:
+                raise AmbiguousProviderError(f"{type(exc).__name__}: {exc}") from exc
             raise TransientProviderError(f"{type(exc).__name__}: {exc}") from exc
 
         message_id = result.get("id", "") if isinstance(result, dict) else (getattr(result, "id", "") or "")
@@ -133,11 +141,19 @@ class ResendProvider(EmailProvider):
         from_name: Optional[str] = None,
         reply_to: Optional[str] = None,
         idempotency_key_prefix: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> list[BatchItemResult]:
         results: list[BatchItemResult] = []
         for start in range(0, len(jobs), self._max_batch_size):
             chunk = jobs[start:start + self._max_batch_size]
-            results.extend(self._send_one_chunk(chunk, from_email, from_name, reply_to, idempotency_key_prefix))
+            results.extend(self._send_one_chunk(
+                chunk,
+                from_email,
+                from_name,
+                reply_to,
+                idempotency_key_prefix,
+                idempotency_key=idempotency_key if len(jobs) <= self._max_batch_size else None,
+            ))
         return results
 
     def _send_one_chunk(
@@ -147,6 +163,7 @@ class ResendProvider(EmailProvider):
         from_name: Optional[str],
         reply_to: Optional[str],
         idempotency_key_prefix: Optional[str],
+        idempotency_key: Optional[str] = None,
     ) -> list[BatchItemResult]:
         sender = f"{from_name} <{from_email}>" if from_name else from_email
         payload = []
@@ -157,7 +174,9 @@ class ResendProvider(EmailProvider):
             payload.append(item)
 
         options: dict = {"batch_validation": "permissive"}
-        if idempotency_key_prefix:
+        if idempotency_key:
+            options["idempotency_key"] = idempotency_key
+        elif idempotency_key_prefix:
             options["idempotency_key"] = _batch_key(idempotency_key_prefix, chunk)
 
         self._rate_limiter.acquire()  # one token for the WHOLE chunk, not per recipient
@@ -176,12 +195,24 @@ class ResendProvider(EmailProvider):
                     chunk, from_email=from_email, from_name=from_name, reply_to=reply_to,
                     idempotency_key_prefix=f"{idempotency_key_prefix}:fallback" if idempotency_key_prefix else None,
                 )
-            # Auth/domain/quota/rate-limit/5xx/unknown: not item-specific.
-            # Retry the whole chunk later, unchanged.
+            if status == 429:
+                error_msg = f"{type(exc).__name__}: {exc}"
+                return [
+                    BatchItemResult(ref=job.ref, ok=False, error=error_msg, permanent=False,
+                                     retry_after_seconds=retry_after, ambiguous=False)
+                    for job in chunk
+                ]
+            if status in _SINGLE_SEND_PERMANENT_STATUS_CODES:
+                error_msg = f"{type(exc).__name__}: {exc}"
+                return [
+                    BatchItemResult(ref=job.ref, ok=False, error=error_msg, permanent=True, ambiguous=False)
+                    for job in chunk
+                ]
+            # No status code or 5xx/network/timeout: ambiguous outcome where provider may have received it.
             error_msg = f"{type(exc).__name__}: {exc}"
             return [
                 BatchItemResult(ref=job.ref, ok=False, error=error_msg, permanent=False,
-                                 retry_after_seconds=retry_after)
+                                 retry_after_seconds=retry_after, ambiguous=True)
                 for job in chunk
             ]
 
