@@ -118,7 +118,8 @@ class ResendProvider(EmailProvider):
             status = _status_of(exc)
             if status in _SINGLE_SEND_PERMANENT_STATUS_CODES:
                 raise PermanentProviderError(f"{type(exc).__name__}: {exc}") from exc
-            raise TransientProviderError(f"{type(exc).__name__}: {exc}") from exc
+            retry_after = _retry_after_of(exc)
+            raise TransientProviderError(f"{type(exc).__name__}: {exc}", retry_after_seconds=retry_after) from exc
 
         message_id = result.get("id", "") if isinstance(result, dict) else (getattr(result, "id", "") or "")
         return SendResult(provider_message_id=message_id)

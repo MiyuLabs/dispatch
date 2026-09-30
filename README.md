@@ -199,6 +199,21 @@ class SesProvider(EmailProvider):
         ...
 ```
 
+Verify that your provider satisfies the engine's contract using the reusable contract test suite:
+```python
+import pytest
+from tests.provider_contract import EmailProviderContract
+
+class TestSesProviderContract(EmailProviderContract):
+    __test__ = True
+
+    @pytest.fixture
+    def provider(self):
+        return SesProvider(...)
+```
+The contract suite validates single-send success, permanent/transient failure handling, retry-after propagation, batch delivery, partial failure isolation, opaque ref preservation, and empty batches without live network calls.
+
+
 ### 4. Custom Validators
 Subclass `dispatch.validation.RecipientValidator` to add third-party validation APIs or reject disposable email providers:
 ```python

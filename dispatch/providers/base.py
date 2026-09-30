@@ -8,6 +8,10 @@ from typing import Optional
 class TransientProviderError(Exception):
     """A failure worth retrying: network blip, 5xx, or 429 rate limit."""
 
+    def __init__(self, *args, retry_after_seconds: Optional[float] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.retry_after_seconds = retry_after_seconds
+
 
 class PermanentProviderError(Exception):
     """A failure that will never succeed on retry: bad address, invalid
@@ -104,7 +108,13 @@ class EmailProvider(ABC):
             except PermanentProviderError as e:
                 results.append(BatchItemResult(ref=job.ref, ok=False, error=str(e), permanent=True))
             except TransientProviderError as e:
-                results.append(BatchItemResult(ref=job.ref, ok=False, error=str(e), permanent=False))
+                results.append(BatchItemResult(
+                    ref=job.ref,
+                    ok=False,
+                    error=str(e),
+                    permanent=False,
+                    retry_after_seconds=getattr(e, "retry_after_seconds", None),
+                ))
             else:
                 results.append(BatchItemResult(ref=job.ref, ok=True, message_id=result.provider_message_id))
         return results
