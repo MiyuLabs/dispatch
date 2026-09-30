@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from .models import Recipient
 
@@ -52,6 +54,33 @@ CREATE TABLE IF NOT EXISTS campaign_recipients (
     imported_at TEXT NOT NULL,
     UNIQUE(campaign, recipient_id)
 );
+
+-- In-flight provider batches. Tracks the durable identity and exact membership
+-- of every batch submitted to or prepared for an external provider. Survives
+-- process crashes so recovery can retry the exact same batch with the exact same
+-- idempotency key.
+CREATE TABLE IF NOT EXISTS send_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_send_batches_campaign_status
+    ON send_batches(campaign, status);
+
+CREATE TABLE IF NOT EXISTS send_batch_items (
+    batch_id INTEGER NOT NULL REFERENCES send_batches(id) ON DELETE CASCADE,
+    send_id INTEGER NOT NULL REFERENCES campaign_sends(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, send_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_send_batch_items_send_id
+    ON send_batch_items(send_id);
 """
 
 # Valid statuses:
@@ -65,6 +94,22 @@ TERMINAL_STATUSES = {"sent", "skipped", "dead"}
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def compute_batch_idempotency_key(prefix: str, refs: Iterable[object]) -> str:
+    """Derive a stable idempotency key for an exact set of jobs in a batch."""
+    digest = hashlib.sha256(",".join(sorted(str(r) for r in refs)).encode()).hexdigest()[:24]
+    return f"{prefix}:batch:{digest}"
+
+
+@dataclass(frozen=True)
+class JobReconciliationUpdate:
+    send_id: int
+    status: str
+    attempts: int
+    provider_message_id: Optional[str] = None
+    last_error: Optional[str] = None
+    next_attempt_at: Optional[str] = None
 
 
 class StateStore:
@@ -202,9 +247,9 @@ class StateStore:
     # ---- queue: claim / complete / fail ------------------------------------
 
     def claim_batch(self, campaign: str, limit: int) -> list[sqlite3.Row]:
-        """Atomically move up to `limit` eligible jobs to 'sending' and
-        return them. Eligible = pending, or failed with an elapsed backoff
-        and attempts remaining."""
+        """Atomically select eligible jobs, persist their durable batch identity,
+        and move them to 'sending' in ONE transaction.
+        Eligible = pending, or failed with an elapsed backoff and attempts remaining."""
         now = _now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -225,13 +270,152 @@ class StateStore:
             ).fetchall()
             if rows:
                 ids = [r["send_id"] for r in rows]
+                batch_key = compute_batch_idempotency_key(f"dispatch:{campaign}", ids)
+                cur = conn.execute(
+                    """INSERT INTO send_batches (campaign, idempotency_key, status, created_at, updated_at)
+                       VALUES (?, ?, 'pending', ?, ?)""",
+                    (campaign, batch_key, now, now),
+                )
+                batch_id = cur.lastrowid
+                for pos, sid in enumerate(ids):
+                    conn.execute(
+                        """INSERT INTO send_batch_items (batch_id, send_id, position)
+                           VALUES (?, ?, ?)""",
+                        (batch_id, sid, pos),
+                    )
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
                     f"UPDATE campaign_sends SET status='sending', updated_at=? WHERE id IN ({placeholders})",
                     (now, *ids),
                 )
+                rows = conn.execute(
+                    f"""SELECT ? AS batch_id, cs.id AS send_id, cs.attempts,
+                               r.id AS recipient_id, r.email, r.source,
+                               r.external_id, r.metadata, r.source_created_at
+                        FROM campaign_sends cs
+                        JOIN recipients r ON r.id = cs.recipient_id
+                        WHERE cs.id IN ({placeholders})
+                        ORDER BY cs.id""",
+                    (batch_id, *ids),
+                ).fetchall()
             conn.execute("COMMIT")
             return rows
+
+    def unfinished_batches(self, campaign: str) -> list[sqlite3.Row]:
+        """Return all unfinished durable batches for a campaign, ordered by id."""
+        with self._connect() as conn:
+            return conn.execute(
+                """SELECT id, campaign, idempotency_key, status, last_error, created_at, updated_at
+                   FROM send_batches
+                   WHERE campaign = ?
+                   ORDER BY id""",
+                (campaign,),
+            ).fetchall()
+
+    def get_batch_jobs(self, batch_id: int) -> list[sqlite3.Row]:
+        """Return the exact jobs belonging to a durable batch in their original position order."""
+        with self._connect() as conn:
+            return conn.execute(
+                """SELECT sbi.batch_id, cs.id AS send_id, cs.attempts,
+                          r.id AS recipient_id, r.email, r.source,
+                          r.external_id, r.metadata, r.source_created_at
+                   FROM send_batch_items sbi
+                   JOIN campaign_sends cs ON cs.id = sbi.send_id
+                   JOIN recipients r ON r.id = cs.recipient_id
+                   WHERE sbi.batch_id = ?
+                   ORDER BY sbi.position""",
+                (batch_id,),
+            ).fetchall()
+
+    def get_send_batch(self, batch_id: int) -> Optional[sqlite3.Row]:
+        """Fetch a durable batch record by id."""
+        with self._connect() as conn:
+            return conn.execute(
+                """SELECT id, campaign, idempotency_key, status, last_error, created_at, updated_at
+                   FROM send_batches
+                   WHERE id = ?""",
+                (batch_id,),
+            ).fetchone()
+
+    def record_batch_error(self, batch_id: int, error: str) -> None:
+        """Record diagnostic error information on an in-flight durable batch."""
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE send_batches
+                   SET last_error = ?, updated_at = ?
+                   WHERE id = ?""",
+                (error[:2000], now, batch_id),
+            )
+
+    def reconcile_batch(
+        self,
+        batch_id: int,
+        updates: list[JobReconciliationUpdate | dict[str, Any]],
+    ) -> None:
+        """Atomically reconcile all jobs in a durable batch and finalize/remove
+        the batch record in ONE SQLite transaction."""
+        now = _now()
+
+        def _get_val(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for up in updates:
+                    send_id = _get_val(up, "send_id")
+                    status = _get_val(up, "status")
+                    attempts = _get_val(up, "attempts")
+                    provider_message_id = _get_val(up, "provider_message_id")
+                    last_error = _get_val(up, "last_error")
+                    next_attempt_at = _get_val(up, "next_attempt_at")
+
+                    if status == "sent":
+                        conn.execute(
+                            """UPDATE campaign_sends
+                               SET status='sent',
+                                   attempts=?,
+                                   provider_message_id=COALESCE(?, provider_message_id),
+                                   sent_at=?,
+                                   last_error=NULL,
+                                   next_attempt_at=NULL,
+                                   updated_at=?
+                               WHERE id=?""",
+                            (attempts, provider_message_id, now, now, send_id),
+                        )
+                    elif status == "dead":
+                        conn.execute(
+                            """UPDATE campaign_sends
+                               SET status='dead',
+                                   attempts=?,
+                                   last_error=?,
+                                   next_attempt_at=NULL,
+                                   updated_at=?
+                               WHERE id=?""",
+                            (attempts, (last_error or "")[:2000], now, send_id),
+                        )
+                    elif status == "failed":
+                        conn.execute(
+                            """UPDATE campaign_sends
+                               SET status='failed',
+                                   attempts=?,
+                                   last_error=?,
+                                   next_attempt_at=?,
+                                   updated_at=?
+                               WHERE id=?""",
+                            (attempts, (last_error or "")[:2000], next_attempt_at, now, send_id),
+                        )
+                    else:
+                        raise ValueError(f"Unknown status for reconciliation: {status}")
+
+                conn.execute("DELETE FROM send_batches WHERE id = ?", (batch_id,))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def pending_jobs_for_preview(self, campaign: str, limit: int = 500) -> list[sqlite3.Row]:
         """Read pending or due-for-retry jobs without modifying their status to 'sending' —
@@ -256,14 +440,19 @@ class StateStore:
 
     def recover_stale_sending_jobs(self, campaign: str, older_than_seconds: float = 300) -> int:
         """Reset jobs stuck in 'sending' (e.g. from an interrupted or crashed run)
-        back to 'pending' if updated_at is older than `older_than_seconds` ago."""
+        back to 'pending' if updated_at is older than `older_than_seconds` ago,
+        as a fallback for legacy jobs not attached to a durable send batch."""
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat()
         now = _now()
         with self._connect() as conn:
             cur = conn.execute(
                 """UPDATE campaign_sends
                    SET status='pending', updated_at=?
-                   WHERE campaign=? AND status='sending' AND updated_at<=?""",
+                   WHERE campaign=? AND status='sending' AND updated_at<=?
+                     AND id NOT IN (
+                         SELECT sbi.send_id FROM send_batch_items sbi
+                         JOIN send_batches sb ON sb.id = sbi.batch_id
+                     )""",
                 (now, campaign, cutoff),
             )
             return cur.rowcount
@@ -272,7 +461,10 @@ class StateStore:
         with self._connect() as conn:
             conn.execute(
                 """UPDATE campaign_sends
-                   SET status='sent', provider_message_id=?, sent_at=?, updated_at=?
+                   SET status='sent',
+                       provider_message_id=COALESCE(?, provider_message_id),
+                       sent_at=?,
+                       updated_at=?
                    WHERE id=?""",
                 (provider_message_id, _now(), _now(), send_id),
             )

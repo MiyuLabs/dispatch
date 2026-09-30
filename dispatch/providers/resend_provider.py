@@ -14,6 +14,7 @@ from .base import (
     SendResult,
     TransientProviderError,
 )
+from ..db import compute_batch_idempotency_key
 from ..ratelimit import TokenBucket
 
 logger = logging.getLogger(__name__)
@@ -61,8 +62,7 @@ def _batch_key(prefix: str, chunk: list[EmailJob]) -> str:
     same chunk is retried unchanged, Resend recognizes it and won't
     double-send. If the chunk's membership changes (e.g. a smaller retry
     after some jobs already succeeded), the key changes too, as it must."""
-    digest = hashlib.sha256(",".join(sorted(str(j.ref) for j in chunk)).encode()).hexdigest()[:24]
-    return f"{prefix}:batch:{digest}"
+    return compute_batch_idempotency_key(prefix, (j.ref for j in chunk))
 
 
 class ResendProvider(EmailProvider):

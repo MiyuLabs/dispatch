@@ -27,7 +27,7 @@ Lightweight, extensible, stateful campaign mailer and delivery engine for MiyuLa
 - **Permissive Batch Delivery:** Bundles up to 100 emails per HTTP request with `x-batch-validation: permissive`. If 98 pass and 2 fail validation, Resend sends the 98 and Dispatch isolates the 2 failures in **one single API call** without looping one-by-one.
 - **Bounce Protection via Enqueue Validation:** Verifies email syntax, rejects RFC 7505 Null MX records (`. IN MX 0 .`), and resolves domain MX records (with A-record fallback per RFC 5321) with in-process caching before queueing, keeping bounce rates safely below 4%.
 - **Exponential Backoff with Full Jitter:** Resilient retry scheduling with jitter (`random(0, min(cap, base * 2^attempts))`) and dynamic adoption of provider `retry-after` header delay floors.
-- **Automatic Crash & Interruption Recovery:** Stale jobs interrupted in `sending` state during unexpected shutdowns or restarts are automatically reclaimed and reset to `pending` on the next run.
+- **Durable Crash & Interruption Recovery:** In-flight provider batches preserve their exact membership across crashes. Unfinished batches are recovered deterministically with identical provider idempotency keys and reconciled in a single atomic SQLite transaction. Legacy `sending` jobs without batch records fall back to automatic stale recovery.
 - **Non-Destructive Dry Run:** Renders, substitutes metadata, logs, and validates emails end-to-end without mutating queue records or calling provider endpoints.
 
 ---
@@ -62,6 +62,56 @@ Source.fetch() -> Recipient(s) -> StateStore (SQLite: recipients)
 | `Template` | `render(recipient) -> RenderedEmail` | `LaunchTemplate` (HTML + plain text pre-order discount) |
 | `EmailProvider` | `send(...)`, `send_batch(...)` | `ResendProvider` (permissive batching + token bucket rate limit) |
 | `StateStore` | Durable SQLite State & Queue | `StateStore` (WAL mode, atomic transactions, crash recovery) |
+
+---
+
+## Crash Safety & Batch Recovery Semantics
+
+Dispatch implements a durable batch reconciliation protocol to guarantee crash resilience and consistency between external provider submissions and local SQLite state updates:
+
+```
+pending
+  │
+  ▼
+[BEGIN IMMEDIATE]
+  ├── Select eligible jobs
+  ├── Create durable send_batches record
+  ├── Persist exact send IDs in send_batch_items
+  └── Move claimed jobs to 'sending'
+[COMMIT]
+  │
+  ▼
+Provider API Submission (with batch idempotency key derived from exact membership)
+  │
+  ▼
+[BEGIN IMMEDIATE]
+  ├── Validate complete 1:1 response mapping
+  ├── Update campaign_sends (sent / failed / dead, preserving provider message IDs)
+  └── Finalize/remove durable send_batches record
+[COMMIT]
+```
+
+### Why `sending` Exists
+Jobs transition from `pending` (or due `failed`) to `sending` inside an atomic SQLite transaction when claimed. This prevents concurrent or subsequent workers from double-claiming in-flight jobs while a provider API call is active.
+
+### Interrupted Submissions & Crash Recovery
+If a process crashes or restarts after the provider accepts a batch but before local reconciliation commits:
+1. The affected jobs remain in `sending` status.
+2. The batch membership table (`send_batch_items`) preserves the exact send IDs in their original order.
+3. On the next execution, `SendEngine` discovers all unfinished batches in `send_batches` **before** claiming new work.
+4. The exact original batch is reconstructed without altering its membership or regrouping jobs with unrelated pending sends.
+
+### Deterministic Batch Idempotency
+Because batch membership is preserved, the engine recalculates the exact same batch idempotency key (`dispatch:<campaign>:batch:<sha256>`) when retrying the provider call. External providers (such as Resend) recognize this idempotency key and return existing message outcomes rather than re-delivering duplicate emails.
+
+### Atomic Local Reconciliation
+Reconciling a provider batch updates all affected `campaign_sends` rows (transitioning jobs to `sent` with their provider message IDs, `dead` for permanent errors/exhausted attempts, or `failed` with exponential retry backoff) and finalizes the durable batch record inside a **single SQLite transaction**. If reconciliation fails halfway through, SQLite rolls back all mutations, leaving the batch intact for recovery on the next attempt.
+
+### Ambiguous Provider Responses
+If a provider returns a malformed, incomplete, or ambiguous response that cannot be mapped 1:1 to every claimed job, Dispatch records the diagnostic error on the durable batch and does **not** commit partial state changes. The entire batch remains in `sending` and is safely retried on the next run.
+
+> [!NOTE]
+> Dispatch provides retry-safe recovery through durable batch identity coupled with deterministic provider idempotency keys. It does not (and cannot) establish a literal distributed transaction across SQLite and third-party HTTP endpoints.
 
 ---
 

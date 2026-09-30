@@ -5,10 +5,10 @@ import logging
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from .config import Settings
-from .db import StateStore
+from .db import JobReconciliationUpdate, StateStore
 from .models import Recipient
 from .providers.base import EmailJob, EmailProvider
 from .sources.base import Source
@@ -173,12 +173,35 @@ class SendEngine:
             return stats
 
         stats = SendStats()
+
+        # Step 1: Recover and reconcile any unfinished durable batches before claiming new jobs
+        unfinished = self.store.unfinished_batches(campaign)
+        for batch_row in unfinished:
+            batch_id = batch_row["id"]
+            rows = self.store.get_batch_jobs(batch_id)
+            if not rows:
+                self.store.reconcile_batch(batch_id, [])
+                continue
+            stats.claimed += len(rows)
+            processed_ok = self._process_batch(campaign, rows, stats, batch_id=batch_id)
+            if not processed_ok:
+                return stats
+
+        # Step 2: Determine chunk size aligned with the provider's batch limit
+        provider_limit = getattr(self.provider, "_max_batch_size", getattr(self.provider, "max_batch_size", None))
+        if provider_limit is None and hasattr(self, "settings") and self.settings:
+            provider_limit = getattr(self.settings, "max_batch_size", None)
+        claim_limit = min(batch_size, provider_limit) if provider_limit else batch_size
+
         while True:
-            batch = self.store.claim_batch(campaign, batch_size)
+            batch = self.store.claim_batch(campaign, claim_limit)
             if not batch:
                 break
             stats.claimed += len(batch)
-            self._process_batch(campaign, batch, stats)
+            batch_id = batch[0]["batch_id"]
+            processed_ok = self._process_batch(campaign, batch, stats, batch_id=batch_id)
+            if not processed_ok:
+                break
         return stats
 
     def run_until_drained(self, campaign: str, batch_size: int = 500, max_wait_seconds: float = 3600) -> SendStats:
@@ -211,9 +234,47 @@ class SendEngine:
             _time.sleep(min(30, self.settings.base_backoff_seconds))
         return total
 
-    def _process_batch(self, campaign: str, rows: list, stats: SendStats) -> None:
+    def _validate_batch_results(
+        self,
+        results: Any,
+        expected_refs: set[object],
+    ) -> tuple[bool, Optional[str]]:
+        if not isinstance(results, list):
+            return False, f"Provider results must be a list, got {type(results).__name__}"
+        if len(results) != len(expected_refs):
+            return (
+                False,
+                f"Result count mismatch: expected {len(expected_refs)}, got {len(results)}",
+            )
+        seen_refs = set()
+        for idx, item in enumerate(results):
+            if not hasattr(item, "ref") or not hasattr(item, "ok") or not isinstance(item.ok, bool):
+                return False, f"Malformed item at index {idx}: {item!r}"
+            if item.ref not in expected_refs:
+                return False, f"Unexpected result ref at index {idx}: {item.ref!r}"
+            if item.ref in seen_refs:
+                return False, f"Duplicate result for ref: {item.ref!r}"
+            seen_refs.add(item.ref)
+        if seen_refs != expected_refs:
+            missing = expected_refs - seen_refs
+            return False, f"Missing results for refs: {sorted(str(r) for r in missing)}"
+        return True, None
+
+    def _process_batch(
+        self,
+        campaign: str,
+        rows: list,
+        stats: SendStats,
+        batch_id: Optional[int] = None,
+    ) -> bool:
+        if not rows:
+            return True
+        if batch_id is None:
+            batch_id = rows[0]["batch_id"]
+
         rows_by_send_id = {row["send_id"]: row for row in rows}
         jobs: list[EmailJob] = []
+        render_failures: list[JobReconciliationUpdate] = []
 
         for row in rows:
             recipient = _row_to_recipient(row)
@@ -221,38 +282,116 @@ class SendEngine:
                 rendered = self.template.render(recipient)
             except Exception as exc:
                 logger.exception("Template render failed for %s", recipient.email)
-                self.store.mark_failed(row["send_id"], row["attempts"] + 1, f"render error: {exc}", next_attempt_at=None)
-                stats.failed_exhausted += 1
+                render_failures.append(
+                    JobReconciliationUpdate(
+                        send_id=row["send_id"],
+                        status="dead",
+                        attempts=row["attempts"] + 1,
+                        last_error=f"render error: {exc}",
+                        next_attempt_at=None,
+                    )
+                )
                 continue
-            jobs.append(EmailJob(ref=row["send_id"], to=recipient.email, subject=rendered.subject, html=rendered.html, text=rendered.text))
+            jobs.append(
+                EmailJob(
+                    ref=row["send_id"],
+                    to=recipient.email,
+                    subject=rendered.subject,
+                    html=rendered.html,
+                    text=rendered.text,
+                )
+            )
 
         if not jobs:
-            return
+            self.store.reconcile_batch(batch_id, render_failures)
+            stats.failed_exhausted += len(render_failures)
+            return True
 
-        results = self.provider.send_batch(
-            jobs,
-            from_email=self.settings.from_email,
-            from_name=self.settings.from_name,
-            reply_to=self.settings.reply_to,
-            idempotency_key_prefix=f"dispatch:{campaign}",
-        )
+        try:
+            results = self.provider.send_batch(
+                jobs,
+                from_email=self.settings.from_email,
+                from_name=self.settings.from_name,
+                reply_to=self.settings.reply_to,
+                idempotency_key_prefix=f"dispatch:{campaign}",
+            )
+        except Exception as exc:
+            logger.exception("Provider send_batch failed for batch %s", batch_id)
+            self.store.record_batch_error(batch_id, f"provider error: {exc}")
+            return False
 
+        is_valid, validation_error = self._validate_batch_results(results, {j.ref for j in jobs})
+        if not is_valid:
+            logger.error(
+                "Ambiguous or structurally invalid provider response for batch %s: %s",
+                batch_id,
+                validation_error,
+            )
+            self.store.record_batch_error(batch_id, f"ambiguous response: {validation_error}")
+            return False
+
+        updates: list[JobReconciliationUpdate] = list(render_failures)
         for result in results:
             row = rows_by_send_id[result.ref]
             attempts = row["attempts"] + 1
             if result.ok:
-                self.store.mark_sent(result.ref, result.message_id)
-                stats.sent += 1
+                updates.append(
+                    JobReconciliationUpdate(
+                        send_id=result.ref,
+                        status="sent",
+                        attempts=attempts,
+                        provider_message_id=result.message_id,
+                    )
+                )
             elif result.permanent:
-                self.store.mark_failed(result.ref, attempts, result.error or "permanent failure", next_attempt_at=None)
-                stats.failed_exhausted += 1
+                updates.append(
+                    JobReconciliationUpdate(
+                        send_id=result.ref,
+                        status="dead",
+                        attempts=attempts,
+                        last_error=result.error or "permanent failure",
+                        next_attempt_at=None,
+                    )
+                )
             elif attempts >= self.settings.max_attempts:
-                self.store.mark_failed(result.ref, attempts, result.error or "retries exhausted", next_attempt_at=None)
-                stats.failed_exhausted += 1
+                updates.append(
+                    JobReconciliationUpdate(
+                        send_id=result.ref,
+                        status="dead",
+                        attempts=attempts,
+                        last_error=result.error or "retries exhausted",
+                        next_attempt_at=None,
+                    )
+                )
             else:
                 next_at = _next_attempt_at(
-                    attempts, self.settings.base_backoff_seconds, self.settings.max_backoff_seconds,
+                    attempts,
+                    self.settings.base_backoff_seconds,
+                    self.settings.max_backoff_seconds,
                     floor_seconds=result.retry_after_seconds,
                 )
-                self.store.mark_failed(result.ref, attempts, result.error or "transient failure", next_attempt_at=next_at)
+                updates.append(
+                    JobReconciliationUpdate(
+                        send_id=result.ref,
+                        status="failed",
+                        attempts=attempts,
+                        last_error=result.error or "transient failure",
+                        next_attempt_at=next_at,
+                    )
+                )
+
+        try:
+            self.store.reconcile_batch(batch_id, updates)
+        except Exception:
+            logger.exception("Atomic reconciliation failed for batch %s", batch_id)
+            raise
+
+        for up in updates:
+            if up.status == "sent":
+                stats.sent += 1
+            elif up.status == "dead":
+                stats.failed_exhausted += 1
+            elif up.status == "failed":
                 stats.failed_retryable += 1
+
+        return True
