@@ -8,51 +8,17 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Iterator, Optional
 
+from .migrations import (
+    CURRENT_SCHEMA_VERSION,
+    MIGRATIONS,
+    MigrationError,
+    SCHEMA,
+    apply_migrations,
+    get_schema_version,
+)
 from .models import Recipient
 
 logger = logging.getLogger(__name__)
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS recipients (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL UNIQUE,
-    source TEXT NOT NULL,
-    external_id TEXT,
-    metadata TEXT NOT NULL DEFAULT '{}',
-    source_created_at TEXT,
-    first_seen_at TEXT NOT NULL
-);
-
--- One row per (recipient, campaign). This table IS the job queue: a
--- 'pending' row, or a 'failed' row whose next_attempt_at has elapsed, is a
--- unit of work waiting to be claimed. Because it lives in SQLite, a crashed
--- or interrupted run picks up exactly where it left off with no separate
--- broker required, and the UNIQUE constraint makes "don't email someone
--- twice for the same campaign" structurally impossible to violate.
-CREATE TABLE IF NOT EXISTS campaign_sends (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    recipient_id INTEGER NOT NULL REFERENCES recipients(id),
-    campaign TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT,
-    provider_message_id TEXT,
-    next_attempt_at TEXT,
-    sent_at TEXT,
-    updated_at TEXT NOT NULL,
-    UNIQUE(recipient_id, campaign)
-);
-
-CREATE INDEX IF NOT EXISTS idx_campaign_sends_claim
-    ON campaign_sends(campaign, status, next_attempt_at);
-
-CREATE TABLE IF NOT EXISTS campaign_recipients (
-    campaign TEXT NOT NULL,
-    recipient_id INTEGER NOT NULL REFERENCES recipients(id),
-    imported_at TEXT NOT NULL,
-    UNIQUE(campaign, recipient_id)
-);
-"""
 
 # Valid statuses:
 #   pending -> sending -> sent                         (success)
@@ -79,7 +45,7 @@ class StateStore:
         self.db_path = db_path
         self._local = threading.local()
         with self._connect() as conn:
-            conn.executescript(SCHEMA)
+            apply_migrations(conn)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:

@@ -211,6 +211,27 @@ class DisposableBlockerValidator(RecipientValidator):
 
 ---
 
+## Database Migrations
+
+Dispatch stores persistent recipient, campaign, and send queue state in SQLite. Database schema evolution is explicitly tracked and versioned:
+
+- **Explicit Schema Versioning:** Database schema version is tracked using SQLite's native `PRAGMA user_version`.
+- **Automatic Startup Migration:** Pending migrations are applied sequentially and automatically when `StateStore` initializes. No manual migration step is required during normal operations.
+- **State & Legacy Preservation:** Existing unversioned databases (version 0) are upgraded to the baseline schema without recreating application state or losing recipient and delivery records.
+- **Transactional & Atomic:** Each migration runs inside an immediate transaction (`BEGIN IMMEDIATE` ... `COMMIT`). If an error occurs during migration, the transaction is rolled back completely (`ROLLBACK`), leaving the database at its previous version and safe to retry.
+- **Forward-Compatibility Guard:** Databases created by newer application versions (where `user_version > CURRENT_SCHEMA_VERSION`) are rejected with an explicit error rather than attempting an unsafe automatic downgrade.
+
+### Adding a Future Migration
+
+When introducing schema changes:
+1. Define a new migration function in `dispatch/migrations.py` (e.g. `migration_002_your_change(conn: sqlite3.Connection)`).
+2. Register the migration in the `MIGRATIONS` mapping (`2: migration_002_your_change`).
+3. Increment `CURRENT_SCHEMA_VERSION = 2`.
+4. Add upgrade and regression tests in `tests/test_migrations.py`.
+5. Keep existing migrations unchanged so prior versions can upgrade sequentially.
+
+---
+
 ## Pre-Flight Checklist & Notes
 
 - **Resend Domain Verification:** Verify your sending domain in the Resend dashboard before dispatching. Emails sent from unverified domains will fail immediately.
